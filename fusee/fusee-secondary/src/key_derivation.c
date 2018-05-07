@@ -1,8 +1,11 @@
+#include <stdio.h>
 #include "key_derivation.h"
 #include "masterkey.h"
 #include "se.h"
 #include "exocfg.h"
 #include "fuse.h"
+#include "sdmmc.h"
+#include "hwinit/hwinit.h"
 
 static const u8 keyblob_seeds[MASTERKEY_REVISION_MAX][0x10] =
 {
@@ -39,7 +42,84 @@ static const uint8_t masterkey_4x_seed[0x10] =
 };
 
 void get_tsec_key(void *dst) {
+                                            // CF 42 00 4D, 32 bits
+    static const u32 TSEC_FW_START_MAGIC = 0xCF42004D; // Little endian
+    printf("[DEBUG] Getting TSEC key\n");
+    // TSEC firwmare is always 0x100 (256) aligned
+    // TSEC firmware is in package1 loader
+    // Grab package1 loader from eMMC
     /* TODO: Implement this method. Attempt to read TSEC fw from NAND, or from SD if that fails. */
+    mc_enable_ahb_redirect();
+    struct mmc emmc; // sdmmc_init will initalize emmc
+    if(sdmmc_init(&emmc, SWITCH_EMMC)) // Returns 0 on success
+    {
+        printf("[DEBUG] Failed initialize eMMC!\n");
+        generic_panic();
+    }
+    if(sdmmc_select_partition(&emmc, MMC_PARTITION_BOOT1))
+    {
+        printf("[DEBUG] Failed to select boot partition!\n");
+        generic_panic();
+    }
+    printf("[DEBUG] eMMC initialized\n");
+
+    // Read package1 loader into memory
+
+    static const u32 PACKAGE1_OFFSET = 0x100000;
+    static const u32 PACKAGE1_SIZE = 0x40000;
+    static const u32 EMMC_SECTOR_SIZE = 512; // bytes
+    static const u32 SUBSECTOR_SIZE = 0x100; // 256, TSEC fw is aligned to it
+    static const u32 PACKAGE1_START_SECTOR = PACKAGE1_OFFSET / EMMC_SECTOR_SIZE;
+    static const u32 PACKAGE1_END_SECTOR = (PACKAGE1_OFFSET + PACKAGE1_SIZE) / EMMC_SECTOR_SIZE;
+    static const u32 PACKAGE1_SECTOR_COUNT = PACKAGE1_END_SECTOR - PACKAGE1_START_SECTOR;
+
+    u32 package1_current_sector = 0;
+
+    u8 package1_buffer[512];
+
+    u32 current_word = 0;
+    printf("Trying %d sectors\n", PACKAGE1_SECTOR_COUNT);
+    while(package1_current_sector < PACKAGE1_SECTOR_COUNT)
+    {
+        // Read one sector at a time
+        if(sdmmc_read(&emmc, package1_buffer, PACKAGE1_START_SECTOR + package1_current_sector, 1))
+        {
+            printf("Failed to read eMMC on package1 sector 0x%02X\n", package1_current_sector);
+            generic_panic();
+        }
+
+        printf("       ");
+        for(u8 i = 0; i < 0x10; i++)
+        {
+            printf("%02X ", i);
+        }
+        printf("\n");
+        for(u32 i = 0; i < 512; i += 0x10)
+        {
+            printf("0x%04X ", i * 0x10);
+            for(u32 j = 0; j < 0x10; j++)
+            {
+                printf("%02X ", package1_buffer[i + j]);
+            }
+            printf("\n");
+        }
+        printf("\n");
+
+        memcpy(&current_word, package1_buffer, sizeof(current_word));
+        if(current_word == TSEC_FW_START_MAGIC)
+        {
+            printf("WE GOT IT! Package1 sector 0x%02X!\n", package1_current_sector);
+            break;
+        }
+        memcpy(&current_word, package1_buffer + SUBSECTOR_SIZE, sizeof(current_word));
+        if(current_word == TSEC_FW_START_MAGIC)
+        {
+            printf("WE GOT IT! Package1 sector 0x%02X!\n", package1_current_sector);
+            break;
+        }
+        package1_current_sector++;
+    }
+    printf("We're out of the loop! Either we found it or we didn't!\n");
 }
 
 void get_keyblob(void *dst, u32 revision) {
